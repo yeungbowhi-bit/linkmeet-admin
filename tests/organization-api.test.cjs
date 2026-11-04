@@ -1,0 +1,50 @@
+// 无需增加测试依赖；将隔离的 TypeScript API 编译到临时目录运行。
+const { test } = require('node:test')
+const assert = require('node:assert/strict')
+const fs = require('node:fs')
+const path = require('node:path')
+const os = require('node:os')
+const ts = require('typescript')
+test('组织业务规则、引用完整性与数据隔离', async () => {
+  const target = fs.mkdtempSync(path.join(os.tmpdir(), 'linkmeet-organization-'))
+  try {
+    for (const file of ['types/organization', 'mock/organization', 'services/organization']) {
+      const output = path.join(target, `${file}.js`)
+      fs.mkdirSync(path.dirname(output), { recursive: true })
+      fs.writeFileSync(output, ts.transpileModule(fs.readFileSync(path.join(__dirname, '../src', `${file}.ts`), 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText)
+    }
+    const { organizationApi: api } = require(path.join(target, 'services/organization.js'))
+    let data = await api.load()
+    data.members[0].name = '不可污染 API'
+    assert.equal((await api.load()).members[0].name, '陈荟')
+    const enterprise = { ...data.enterprises[0], id: '', name: '第二企业' }
+    await api.save('enterprises', enterprise)
+    await assert.rejects(api.save('enterprises', { ...enterprise, name: '第三企业' }), /最多新增两个企业/)
+    await assert.rejects(api.updateRegionMembers('a1', ['m1']), /仅对应区域负责人/)
+    await assert.rejects(api.setMemberStatus('m1', true), /不能停用当前账号/)
+    await assert.rejects(api.setMemberStatus('m2', true), /请先移交/)
+    await assert.rejects(api.save('members', { ...data.members[1], regionId: 'a2' }), /对应区域负责人/)
+    await api.save('regions', { ...data.regions[0], leaderId: 'm1' })
+    await assert.rejects(api.updateRegionMembers('a1', ['m3']), /先由原区域负责人/)
+    assert.equal((await api.load()).members.find(m => m.id === 'm2').regionId, 'a1', '拒绝操作必须保持原区域数据')
+    const invited = { ...data.members[3], id: '', name: '受邀成员', phone: '13900000009', roleIds: ['r2', 'r3'], status: '正常' }
+    await api.save('members', invited)
+    data = await api.load()
+    const created = data.members.find(m => m.phone === invited.phone)
+    assert.equal(created.status, '待加入', '邀请不能绕过真实认证变为正常')
+    assert.deepEqual(created.roleIds, ['r2', 'r3'])
+    await assert.rejects(api.save('members', invited), /手机号已被邀请/)
+    await assert.rejects(api.save('members', { ...created, regionId: 'missing' }), /区域与企业不匹配/)
+    await assert.rejects(api.save('members', { ...created, roleIds: ['missing'] }), /有效角色/)
+    await assert.rejects(api.setMemberStatus('m2', true, created.id), /其他正常成员/)
+    const before = data.members.find(m => m.id === 'm2')
+    data = await api.setMemberStatus('m2', true, 'm3')
+    assert.deepEqual(data.members.find(m => m.id === 'm2'), { ...before, status: '已停用', takeoverId: 'm3' })
+    assert.match(data.logs[0].action, /原业务数据保持不变/)
+    data = await api.setMemberStatus('m2', false)
+    assert.equal(data.members.find(m => m.id === 'm2').takeoverId, '')
+    await api.updateRegionMembers('a1', ['m2', created.id])
+    assert.equal((await api.load()).members.find(m => m.id === created.id).regionId, 'a1')
+    await assert.rejects(api.save('roles', { ...data.roles[0], permissions: ['不存在的功能'] }), /权限配置无效/)
+  } finally { fs.rmSync(target, { recursive: true, force: true }) }
+})
